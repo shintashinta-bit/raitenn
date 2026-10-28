@@ -1,0 +1,64 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, AppState, Modal, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View, KeyboardAvoidingView, Platform } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import * as Crypto from 'expo-crypto';
+import * as DocumentPicker from 'expo-document-picker';
+import { File, Paths } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+import { key, colors, fmt, parse, occurs, validData } from './src/planner.js';
+import { syncNotifications, requestNotifications } from './src/notifications.js';
+
+const repeats = [['none','なし'],['daily','毎日'],['weekly','毎週'],['monthly','毎月'],['yearly','毎年']];
+const reminders = [['off','なし'],['0','時刻通り'],['10','10分前'],['30','30分前'],['60','1時間前']];
+function Button({ children, onPress, primary, label, selected, disabled }) {
+  return <Pressable accessibilityRole="button" accessibilityLabel={label} accessibilityState={{ selected: !!selected, disabled: !!disabled }} disabled={disabled} onPress={onPress} style={[s.button, (primary || selected) && s.primary, disabled && { opacity: .5 }]}><Text style={[s.buttonText,(primary || selected) && { color: 'white' }]}>{children}</Text></Pressable>;
+}
+function Choices({ options, value, onChange }) {
+  return <View style={s.choices}>{options.map(([id,label]) => <Button key={id} selected={id===value} onPress={() => onChange(id)}>{label}</Button>)}</View>;
+}
+function Editor({ item, date, tasks, busy, onSave, onClose, onDelete }) {
+  const [draft,setDraft] = useState({ title: '', date, time: '09:00', allDay: false, repeat: 'none', reminder: 'off', color: colors[0], done: false, ...item });
+  const update = (name,value) => setDraft(d => ({ ...d,[name]:value }));
+  return <Modal visible animationType="slide" onRequestClose={onClose}><SafeAreaView style={s.safe}><KeyboardAvoidingView style={{flex:1}} behavior={Platform.OS==='ios'?'padding':undefined}><ScrollView contentContainerStyle={s.content} keyboardShouldPersistTaps="handled">
+    <Text style={s.heading}>{tasks?'やること':'予定'}を{item?'編集':'追加'}</Text>
+    <Text style={s.label}>タイトル</Text><TextInput accessibilityLabel="タイトル" placeholder="例：友人とランチ" maxLength={100} value={draft.title} onChangeText={v=>update('title',v)} style={s.input}/>
+    <Text style={s.label}>{tasks?'期日':'日付'}</Text><DateTimePicker value={parse(draft.date)} mode="date" locale="ja-JP" display="spinner" onChange={(_,v)=>{if(v)update('date',fmt(v))}}/>
+    {!tasks && <><View style={s.row}><Text style={s.text}>終日</Text><Switch accessibilityLabel="終日" value={draft.allDay} onValueChange={v=>update('allDay',v)} trackColor={{true:'#d49159'}}/></View>{!draft.allDay && <><Text style={s.label}>時刻</Text><DateTimePicker value={new Date(`${draft.date}T${draft.time}`)} mode="time" locale="ja-JP" display="spinner" onChange={(_,v)=>{if(v)update('time',`${String(v.getHours()).padStart(2,'0')}:${String(v.getMinutes()).padStart(2,'0')}`)}}/></>}<Text style={s.label}>繰り返し</Text><Choices options={repeats} value={draft.repeat} onChange={v=>update('repeat',v)}/>{!draft.allDay && <><Text style={s.label}>通知</Text><Choices options={reminders} value={draft.reminder} onChange={v=>update('reminder',v)}/></>}</>}
+    <Text style={s.label}>色</Text><View style={s.choices}>{colors.map((color,i)=><Pressable key={color} accessibilityRole="button" accessibilityLabel={['オレンジ','グリーン','ブルー','ピンク'][i]} accessibilityState={{selected:color===draft.color}} onPress={()=>update('color',color)} style={{backgroundColor:color,width:44,height:44,borderRadius:22,borderWidth:color===draft.color?3:0,borderColor:'#694a36'}}/>)}</View>
+    {item && !tasks && item.repeat!=='none' && <Text style={s.note}>繰り返しの編集・削除は、すべての回に適用されます。</Text>}
+    <Button disabled={busy} primary onPress={()=>{if(!draft.title.trim()){Alert.alert('タイトルを入力してください');return}onSave({...draft,id:item?.id||Crypto.randomUUID(),title:draft.title.trim(),reminder:draft.allDay?'off':draft.reminder})}}>保存</Button><Button disabled={busy} onPress={onClose}>キャンセル</Button>
+    {item && <Button disabled={busy} onPress={()=>Alert.alert('削除しますか？','繰り返し予定は全回削除されます。',[{text:'キャンセル',style:'cancel'},{text:'削除',style:'destructive',onPress:()=>onDelete(item.id)}])}>削除する</Button>}
+  </ScrollView></KeyboardAvoidingView></SafeAreaView></Modal>;
+}
+function Planner() {
+  const [data,setData]=useState({events:[],tasks:[]}), [ready,setReady]=useState(false), [busy,setBusy]=useState(false), [loadError,setLoadError]=useState(false);
+  const [selected,setSelected]=useState(fmt(new Date())), [view,setView]=useState(new Date()), [tab,setTab]=useState('events'), [editor,setEditor]=useState(null), [notice,setNotice]=useState('通知を設定すると、アプリを閉じている間も端末が通知します。');
+  const current=useRef(data), lock=useRef(false);
+  useEffect(()=>{(async()=>{try{const raw=await AsyncStorage.getItem(key);if(raw){const parsed=JSON.parse(raw);if(!validData(parsed))throw Error();current.current=parsed;setData(parsed)}}catch{setLoadError(true);Alert.alert('保存データを読み込めません','元のデータを保護するため、バックアップの読込まで編集を停止します。')}finally{setReady(true)}})()},[]);
+  async function updateNotifications(events) {try{const count=await syncNotifications(events);setNotice(`予約済み通知：${count}件。通知許可とiPhoneの通知設定をご確認ください。`)}catch{setNotice('データは保存済みですが、通知の予約に失敗しました。通知設定から再試行してください。')}}
+  useEffect(()=>{if(!ready||loadError)return;updateNotifications(current.current.events);const sub=AppState.addEventListener('change',state=>{if(state==='active')updateNotifications(current.current.events)});return()=>sub.remove()},[ready,loadError]);
+  async function persist(next) {
+    if(lock.current)return false;lock.current=true;setBusy(true);
+    try{await AsyncStorage.setItem(key,JSON.stringify(next));current.current=next;setData(next);setLoadError(false);updateNotifications(next.events);return true}catch{Alert.alert('保存できません','端末の空き容量を確認してください。');return false}finally{lock.current=false;setBusy(false)}
+  }
+  async function save(draft){const item={id:draft.id,title:draft.title,date:draft.date,color:draft.color,...(tab==='tasks'?{done:draft.done}:{time:draft.time,allDay:draft.allDay,repeat:draft.repeat,reminder:draft.reminder})};const next={...data,[tab]:editor.item?data[tab].map(e=>e.id===item.id?item:e):[...data[tab],item]};if(await persist(next))setEditor(null)}
+  async function backup(){try{const file=new File(Paths.cache,`planner-${fmt(new Date())}.json`);file.create({overwrite:true});file.write(JSON.stringify(data,null,2));if(await Sharing.isAvailableAsync())await Sharing.shareAsync(file.uri,{mimeType:'application/json',UTI:'public.json'});else Alert.alert('この端末では共有できません')}catch{Alert.alert('バックアップを保存できませんでした')}}
+  async function restore(){try{const result=await DocumentPicker.getDocumentAsync({type:['application/json','public.json'],copyToCacheDirectory:true});if(result.canceled)return;const file=new File(result.assets[0].uri);if(file.size>5000000)throw Error();const next=JSON.parse(await file.text());if(!validData(next))throw Error();Alert.alert('データを置き換えますか？','現在の予定はバックアップの内容に置き換わります。',[{text:'キャンセル',style:'cancel'},{text:'読込',onPress:()=>persist(next)}])}catch{Alert.alert('有効なバックアップを選んでください')}}
+  if(!ready)return <SafeAreaView style={s.safe}><ActivityIndicator accessibilityLabel="読込中"/></SafeAreaView>;
+  const first=new Date(view.getFullYear(),view.getMonth(),1),cells=Math.ceil((first.getDay()+new Date(view.getFullYear(),view.getMonth()+1,0).getDate())/7)*7;
+  const items=tab==='events'?data.events.filter(e=>occurs(e,selected)).sort((a,b)=>(a.allDay?'':a.time).localeCompare(b.allDay?'':b.time)):[...data.tasks].sort((a,b)=>Number(a.done)-Number(b.done)||a.date.localeCompare(b.date));
+  return <SafeAreaView style={s.safe}><ScrollView contentContainerStyle={s.content}>
+    <Text style={s.eyebrow}>MY LITTLE PLANNER</Text><View style={s.row}><Text style={s.heading}>日々の予定<Text style={{color:'#d49159'}}>.</Text></Text><Button onPress={()=>{const now=new Date();setSelected(fmt(now));setView(now)}}>今日</Button></View><Text style={s.note}>毎日を、少しずつ心地よく。</Text>
+    <View style={s.row}><Button label="前の月" onPress={()=>setView(new Date(view.getFullYear(),view.getMonth()-1,1))}>‹</Button><Text style={s.month}>{view.getFullYear()}年 {view.getMonth()+1}月</Text><Button label="次の月" onPress={()=>setView(new Date(view.getFullYear(),view.getMonth()+1,1))}>›</Button></View>
+    <View style={s.grid}>{['日','月','火','水','木','金','土'].map(d=><Text key={d} style={s.week}>{d}</Text>)}{Array.from({length:cells},(_,i)=>{const day=new Date(view.getFullYear(),view.getMonth(),1-first.getDay()+i),date=fmt(day);return <Pressable accessibilityRole="button" accessibilityLabel={date} accessibilityState={{selected:date===selected}} key={date} onPress={()=>{setSelected(date);setView(day)}} style={[s.day,date===selected&&{backgroundColor:'#fff0e1'}]}><Text style={[s.text,day.getMonth()!==view.getMonth()&&{color:'#c6baaf'},date===fmt(new Date())&&{color:'#b5652e',fontWeight:'800'}]}>{day.getDate()}</Text><View style={s.dots}>{data.events.filter(e=>occurs(e,date)).slice(0,3).map(e=><View key={e.id} style={[s.dot,{backgroundColor:e.color}]}/>)}</View></Pressable>})}</View>
+    <Choices options={ [['events','予定'],['tasks','やること']] } value={tab} onChange={setTab}/><Text style={s.month}>{tab==='events'?`${parse(selected).getMonth()+1}月${parse(selected).getDate()}日の予定`:'やることリスト'} · {items.length}件</Text>
+    {!items.length && <Text style={s.empty}>予定をひとつずつ、ここに。</Text>}{items.map(item=><View key={item.id} style={[s.card,{borderLeftColor:item.color}]}>{tab==='tasks'&&<Switch accessibilityLabel={item.title+'を完了'} disabled={busy||loadError} value={item.done} onValueChange={v=>persist({...data,tasks:data.tasks.map(t=>t.id===item.id?{...t,done:v}:t)})}/>}<View style={{flex:1}}><Text style={[s.text,item.done&&{textDecorationLine:'line-through'}]}>{item.title}</Text><Text style={s.note}>{tab==='tasks'?`期日 ${item.date}`:(item.allDay?'終日':item.time)+(item.repeat!=='none'?' · 繰り返し':'')}</Text></View><Button disabled={busy||loadError} label={item.title+'を編集'} onPress={()=>setEditor({item})}>編集</Button></View>)}
+    <Button primary disabled={busy||loadError} onPress={()=>setEditor({item:null})}>＋ {tab==='events'?'予定':'やること'}を追加</Button>
+    <Button onPress={async()=>{try{const permission=await requestNotifications();if(permission.granted)await updateNotifications(data.events);else setNotice('通知が許可されていません。iPhoneの設定で通知を許可してください。')}catch{setNotice('通知を設定できませんでした。実機の通知設定を確認してください。')}}}>通知を設定</Button><Text accessibilityLiveRegion="polite" style={s.note}>{notice}</Text><Text style={s.note}>通知は直近60件を予約します。繰り返しは5年先までを対象に、起動・編集時に補充します。長期間開かない場合は予約が尽きることがあります。終日・やることは通知対象外です。</Text>
+    <Button disabled={busy||loadError} onPress={backup}>バックアップ保存</Button><Button disabled={busy} onPress={restore}>バックアップ読込</Button><Text style={s.note}>データはこの端末内に保存されます。アプリ削除前にバックアップしてください。旧ウェブ版からの移行にはJSONバックアップを使用します。</Text>
+  </ScrollView>{editor&&<Editor item={editor.item} date={selected} tasks={tab==='tasks'} busy={busy} onClose={()=>setEditor(null)} onSave={save} onDelete={async id=>{if(await persist({...data,[tab]:data[tab].filter(e=>e.id!==id)}))setEditor(null)}}/>}</SafeAreaView>;
+}
+export default function App(){return <SafeAreaProvider><Planner/></SafeAreaProvider>}
+const s=StyleSheet.create({safe:{flex:1,backgroundColor:'#fff'},content:{padding:20,paddingBottom:40,gap:12},heading:{fontSize:28,fontWeight:'700',color:'#694a36'},eyebrow:{fontSize:11,letterSpacing:3,color:'#ab774e'},text:{fontSize:15,color:'#694a36'},note:{fontSize:12,lineHeight:20,color:'#987d68'},label:{fontSize:14,fontWeight:'600',color:'#694a36'},month:{fontSize:18,fontWeight:'600',color:'#694a36'},row:{flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:10},button:{minHeight:44,paddingHorizontal:15,paddingVertical:12,borderRadius:12,backgroundColor:'#fff1e4',alignItems:'center',justifyContent:'center'},buttonText:{color:'#995423',fontSize:14},primary:{backgroundColor:'#bc713f'},choices:{flexDirection:'row',flexWrap:'wrap',gap:8},grid:{flexDirection:'row',flexWrap:'wrap'},week:{width:'14.285714%',textAlign:'center',fontSize:12,color:'#ac8a70',paddingVertical:12},day:{width:'14.285714%',minHeight:60,borderRadius:12,alignItems:'center',justifyContent:'center'},dots:{flexDirection:'row',gap:3,height:12,paddingTop:7},dot:{width:5,height:5,borderRadius:3},card:{flexDirection:'row',gap:10,alignItems:'center',padding:12,borderWidth:1,borderColor:'#f2e5d9',borderLeftWidth:4,borderRadius:14},input:{borderWidth:1,borderColor:'#e7d7c8',borderRadius:10,padding:14,color:'#694a36',fontSize:16},empty:{padding:26,color:'#a28a77',textAlign:'center',backgroundColor:'#fffbf7',borderRadius:12}});
